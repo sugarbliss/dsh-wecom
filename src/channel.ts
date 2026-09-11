@@ -722,7 +722,23 @@ function stripEpochOf(id: string): string {
 }
 
 function commandOf(message: BaseMessage): string {
-  if (message.msgtype === 'text') return message.text?.content?.trim().toLowerCase() ?? ''
+  const text = textOf(message)
+  const normalized = text.trim().toLowerCase()
+  if (COMMANDS.has(normalized)) return normalized
+
+  // Group callbacks are only delivered after the bot is mentioned, and the
+  // SDK commonly leaves that mention in the text (`@Bot /ping`). The bot's
+  // display name may contain spaces (`@Example Bot /ping`), so identify a
+  // legal command only when it is the final token of a message beginning with
+  // an @-mention. Ordinary prompts whose command-like text is embedded in a
+  // sentence (or followed by more text) remain prompts.
+  if (message.chattype !== 'group' || !normalized.startsWith('@')) return ''
+  const command = normalized.match(/(?:^|\s)(\/\S+)$/)?.[1]
+  return command !== undefined && COMMANDS.has(command) ? command : ''
+}
+
+function textOf(message: BaseMessage): string {
+  if (message.msgtype === 'text') return message.text?.content ?? ''
   if (message.msgtype !== 'mixed') return ''
   const mixed = message.mixed as
     | {
@@ -733,6 +749,4 @@ function commandOf(message: BaseMessage): string {
     .filter((item) => item.msgtype === 'text')
     .map((item) => item.text?.content ?? '')
     .join('')
-    .trim()
-    .toLowerCase()
 }

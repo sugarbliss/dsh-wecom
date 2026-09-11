@@ -38,13 +38,15 @@ async function sendText(
   fire: (event: string, ...args: unknown[]) => unknown,
   text: string,
   msgid = 'm1',
+  chattype: 'single' | 'group' = 'single',
 ): Promise<unknown> {
   return fire('message', {
     headers: { req_id: `r-${msgid}` },
     body: {
       msgid,
       aibotid: 'bot',
-      chattype: 'single',
+      chattype,
+      ...(chattype === 'group' ? { chatid: 'group-1' } : {}),
       from: { userid: 'u1' },
       msgtype: 'text',
       text: { content: text },
@@ -368,6 +370,45 @@ describe('WecomChannel streaming', () => {
     const calls = (client as unknown as { replyStream: ReturnType<typeof vi.fn> }).replyStream.mock
       .calls
     expect(calls.at(-1)?.[2]).toBe('Started a new conversation.')
+    expect(calls.at(-1)?.[3]).toBe(true)
+  })
+
+  it('recognizes commands after the bot mention in group chats', async () => {
+    const { client, fire } = makeClient()
+    const channel = new WecomChannel(
+      makeStreamingSetup([], 'unused') as never,
+      testConfig({ streamFlushMs: 5_000 }),
+      () => client,
+    )
+    await channel.start()
+
+    await sendText(fire, '@Example Bot /ping', 'group-ping', 'group')
+    await sendText(fire, '@Example Bot /new', 'group-new', 'group')
+
+    const calls = (client as unknown as { replyStream: ReturnType<typeof vi.fn> }).replyStream.mock
+      .calls
+    expect(calls.map((call) => call[2])).toEqual([
+      'pong — dsh-wecom connected.',
+      'Started a new conversation.',
+    ])
+    expect(calls.every((call) => call[3] === true)).toBe(true)
+  })
+
+  it('does not treat a slash command mentioned in an ordinary group prompt as a command', async () => {
+    const { client, fire } = makeClient()
+    const channel = new WecomChannel(
+      makeStreamingSetup([], 'agent answer') as never,
+      testConfig({ streamFlushMs: 5_000 }),
+      () => client,
+    )
+    await channel.start()
+
+    await sendText(fire, '@Bot what does /new do?', 'group-prompt', 'group')
+
+    const calls = (client as unknown as { replyStream: ReturnType<typeof vi.fn> }).replyStream.mock
+      .calls
+    expect(calls[0]?.[2]).toBe('Working…')
+    expect(calls.at(-1)?.[2]).toBe('agent answer')
     expect(calls.at(-1)?.[3]).toBe(true)
   })
 
