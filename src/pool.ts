@@ -23,6 +23,7 @@ import type { ResolvedConfig } from './config.js'
 import { clipUtf8, conversationId, Semaphore } from './helpers.js'
 import { type MediaPort, safeFilename, saveUploadFile } from './media.js'
 import { containsImageMedia, toContentBlocks } from './message.js'
+import { type SessionLogLike, sessionLog, sessionLogFrom, sessionLogLength } from './session-log.js'
 
 /** One tool invocation observed during a turn, for the optional activity summary. */
 export interface ToolCallSummary {
@@ -264,7 +265,7 @@ export class ApprovalBridge {
 
   /** The audit `approval/asked` id for this ask, from the session log tail. */
   private approvalIdOf(req: ApprovalRequestLike): string | undefined {
-    const events = req.agent.session.events as readonly {
+    const events = sessionLog(req.agent.session) as readonly {
       type?: string
       data?: { id?: unknown; callId?: unknown }
     }[]
@@ -316,9 +317,13 @@ function stripEpoch(id: string): string {
   return id.replace(/~g\d+$/, '')
 }
 
-/** Structural face of the harness approval request (agent, tool, signal). */
+/**
+ * Structural face of the harness approval request (agent, tool, signal). The
+ * session carries only the log accessors this plugin reads, on either side of
+ * the dsh-session 0.1.5 `events` → `snapshotEvents()` change.
+ */
 interface ApprovalRequestLike {
-  agent: { session: { id: unknown; events: unknown } }
+  agent: { session: { id: unknown } & SessionLogLike }
   toolName: string
   reason?: string
   signal?: {
@@ -745,7 +750,7 @@ export class AgentPool {
     if (kind === 'user') {
       let canonical = this.canonicalTitles.get(id)
       if (canonical === undefined) {
-        canonical = this.previousTitle(session.events, event.seq) ?? title
+        canonical = this.previousTitle(sessionLog(session), event.seq) ?? title
       }
       this.canonicalTitles.set(id, canonical)
       if (title !== canonical) this.renameSession(session, canonical)
@@ -1032,7 +1037,7 @@ export class AgentPool {
     download: MediaPort['download'],
     onDelta?: (delta: TurnDelta) => void,
   ): Promise<Reply> {
-    const start = agent.session.events.length
+    const start = sessionLogLength(agent.session)
     const reasoning: string[] = []
     const pendingCalls = new Map<string, { name: string; arguments: string }>()
     const toolCalls: ToolCallSummary[] = []
@@ -1087,7 +1092,7 @@ export class AgentPool {
     } finally {
       off()
     }
-    const reply = this.extractText(agent.session.events.slice(start))
+    const reply = this.extractText(sessionLogFrom(agent.session, start))
     if (reasoning.length > 0) reply.reasoning = reasoning.join('')
     if (toolCalls.length > 0) reply.toolCalls = toolCalls
     if (images.length > 0) reply.images = images

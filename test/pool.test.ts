@@ -19,8 +19,35 @@ interface FakeAgent {
   fire: (event: string, ...args: unknown[]) => void
 }
 
+/** Which harness session API the double should look like. */
+type SessionApi = 'legacy' | 'snapshot'
+
+/**
+ * Session double. `legacy` mirrors dsh-session 0.1.0-rc.x (`events` getter);
+ * `snapshot` mirrors 0.1.5-rc.x, where that getter is gone and the log is read
+ * through `snapshotEvents()` — the shape that made every production turn fail
+ * with `Cannot read properties of undefined (reading 'length')`.
+ *
+ * The declared type keeps the legacy surface so existing tests can push events;
+ * the snapshot double deliberately carries NO `events` property, so a code path
+ * that still reads it throws here exactly as it did in production.
+ */
+function fakeSession(events: unknown[], id = '', api: SessionApi = 'legacy'): FakeAgent['session'] {
+  const requestHeader = (): undefined => undefined
+  if (api === 'legacy') return { id, events, requestHeader }
+  return {
+    id,
+    get seq() {
+      return events.length
+    },
+    ownEvents: () => events.slice(),
+    snapshotEvents: (from = 0, to = events.length) => events.slice(from, to),
+    requestHeader,
+  } as unknown as FakeAgent['session']
+}
+
 function makeAgent(
-  options: { hang?: boolean; replyText?: string; stream?: unknown[] } = {},
+  options: { hang?: boolean; replyText?: string; stream?: unknown[]; sessionApi?: SessionApi } = {},
 ): FakeAgent {
   const events: unknown[] = []
   const handlers = new Map<string, Set<(...args: unknown[]) => void>>()
@@ -30,7 +57,7 @@ function makeAgent(
   const agent: FakeAgent = {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { id: '', events, requestHeader: () => undefined },
+    session: fakeSession(events, '', options.sessionApi),
     ctx: {
       on: (event: string, handler: (...args: unknown[]) => void) => {
         const set = handlers.get(event) ?? new Set<(...args: unknown[]) => void>()
@@ -66,7 +93,7 @@ function makeAgent(
   return agent
 }
 
-function makeHarness() {
+function makeHarness(harness: { sessionApi?: SessionApi } = {}) {
   const mounts: string[] = []
   const sections: Array<{ name: string; order: number; text: string }> = []
   const disposed: string[] = []
@@ -115,7 +142,7 @@ function makeHarness() {
           setup?: (agentCtx: unknown) => Promise<void>
         }) => {
           created.push({ sessionId: options.sessionId })
-          const agent = makeAgent()
+          const agent = makeAgent({ sessionApi: harness.sessionApi })
           agent.session.id = options.sessionId
           if (options.agentOptions) agent.options = options.agentOptions
           if (options.setup) await options.setup({ systemPrompt: { section } })
@@ -135,7 +162,7 @@ function makeHarness() {
           agentOptions?: { provider: string; model: string }
           setup?: (agentCtx: unknown) => Promise<void>
         }) => {
-          const agent = makeAgent()
+          const agent = makeAgent({ sessionApi: harness.sessionApi })
           agent.session.id = options.resumeSessionId
           if (options.agentOptions) agent.options = options.agentOptions
           if (options.setup) await options.setup({ systemPrompt: { section } })
@@ -1097,5 +1124,62 @@ describe('AgentPool', () => {
         'Compaction is unavailable because this process has an active compaction, or the agent is not idle.',
       )
     })
+  })
+})
+
+/**
+ * dsh-session 0.1.5-rc.x removed the `events` getter that 0.1.0-rc.x exposed
+ * (`snapshotEvents()` / `ownEvents()` / `eventAt()` replaced it). The pool reads
+ * the log on every turn, so the whole feature died on that upgrade — commands
+ * kept working because they never open a session.
+ */
+describe('AgentPool on the dsh-session 0.1.5 session API', () => {
+  it('drives a turn and extracts its reply without an `events` getter', async () => {
+    const { ctx, live, created } = makeHarness({ sessionApi: 'snapshot' })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    await expect(manager.handle(singleMessage('hi'), noopDownload)).resolves.toMatchObject({
+      text: 'Harness reply',
+    })
+
+    // Guard: the double must really look like 0.1.5, or this test proves nothing.
+    const agent = live.get(created[0]?.sessionId ?? '') as FakeAgent | undefined
+    expect(agent).toBeDefined()
+    const session = agent?.session as { events?: unknown } | undefined
+    expect(session?.events).toBeUndefined()
+  })
+
+  it('reverts a manual rename using the snapshot log', async () => {
+    const renamed: string[] = []
+    const { ctx, fireSessionEvent } = makeHarness({ sessionApi: 'snapshot' })
+    ;(ctx.get as ReturnType<typeof vi.fn>).mockImplementation((name: string) =>
+      name === 'sessionTitle'
+        ? { rename: vi.fn((_session: unknown, title: string) => renamed.push(title)) }
+        : undefined,
+    )
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    // The pool has no canonical title for this session yet, so it falls back to
+    // the previous `session/title` in the log (pool.previousTitle).
+    const log: unknown[] = [
+      {
+        type: 'session/title',
+        seq: 3,
+        data: { title: '性能优化', messageSeqs: [], source: { kind: 'provider' } },
+      },
+    ]
+    const session = fakeSession(log, 'dsh-wecom-single-snapshot', 'snapshot')
+    const rename = {
+      type: 'session/title',
+      seq: 4,
+      data: { title: '手动改名', messageSeqs: [], source: { kind: 'user' } },
+    }
+    log.push(rename)
+    fireSessionEvent(session, rename)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(renamed).toEqual(['性能优化'])
   })
 })
