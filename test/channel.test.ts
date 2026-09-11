@@ -496,7 +496,18 @@ describe('WecomChannel streaming', () => {
             content: [
               {
                 type: 'tool-result',
-                content: [{ type: 'image', attachment: { attachmentId: 'img-1', mediaType: 'image/png', bytes: 3, width: 1080, height: 800 } }],
+                content: [
+                  {
+                    type: 'image',
+                    attachment: {
+                      attachmentId: 'img-1',
+                      mediaType: 'image/png',
+                      bytes: 3,
+                      width: 1080,
+                      height: 800,
+                    },
+                  },
+                ],
               },
             ],
           },
@@ -511,7 +522,10 @@ describe('WecomChannel streaming', () => {
     await channel.start()
     await sendText(fire, 'hi', 'm1')
 
-    const media = client as unknown as { uploadMedia: ReturnType<typeof vi.fn>; sendMediaMessage: ReturnType<typeof vi.fn> }
+    const media = client as unknown as {
+      uploadMedia: ReturnType<typeof vi.fn>
+      sendMediaMessage: ReturnType<typeof vi.fn>
+    }
     // One upload (to get media_id) and one sendMediaMessage per rendered card.
     expect(media.uploadMedia).toHaveBeenCalled()
     expect(media.sendMediaMessage).toHaveBeenCalled()

@@ -53,11 +53,7 @@ export interface BotClient {
     fileBuffer: Uint8Array,
     options: { type: 'image'; filename: string },
   ): Promise<{ media_id: string }>
-  sendMediaMessage(
-    chatid: string,
-    mediaType: 'image',
-    mediaId: string,
-  ): Promise<unknown>
+  sendMediaMessage(chatid: string, mediaType: 'image', mediaId: string): Promise<unknown>
   downloadFile(url: string, aesKey?: string): Promise<{ buffer: Uint8Array; filename?: string }>
 }
 
@@ -577,10 +573,12 @@ export class WecomChannel {
           type: 'image',
           filename: `card-${Date.now()}.png`,
         })
-        if (uploaded.media_id === undefined || uploaded.media_id.length === 0) continue
+        const mediaId = uploaded.media_id
+        if (mediaId === undefined || mediaId.length === 0) continue
         await this.retry(async () =>
           timeout(
-            this.liveClient().sendMediaMessage(peer, 'image', uploaded.media_id!),
+            // Bound to a const above: the narrowing must survive into this closure.
+            this.liveClient().sendMediaMessage(peer, 'image', mediaId),
             this.config.sendTimeoutMs,
             'WeCom image push send',
           ),
