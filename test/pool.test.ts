@@ -47,7 +47,14 @@ function fakeSession(events: unknown[], id = '', api: SessionApi = 'legacy'): Fa
 }
 
 function makeAgent(
-  options: { hang?: boolean; replyText?: string; stream?: unknown[]; sessionApi?: SessionApi } = {},
+  options: {
+    hang?: boolean
+    replyText?: string
+    stream?: unknown[]
+    /** Live attempt frames, as dsh-agent 0.1.5-rc.x publishes them. */
+    frames?: unknown[]
+    sessionApi?: SessionApi
+  } = {},
 ): FakeAgent {
   const events: unknown[] = []
   const handlers = new Map<string, Set<(...args: unknown[]) => void>>()
@@ -75,6 +82,9 @@ function makeAgent(
         events.push(event)
         fire('session/event', agent.session, event)
       }
+      // 0.1.5-rc.x: the same deltas arrive as transient attempt frames on an
+      // agent-scoped event and never enter the durable session log.
+      for (const frame of options.frames ?? []) fire('agent/assistant-stream', { agent, frame })
       events.push({
         type: 'assistant/message',
         data: {
@@ -93,7 +103,7 @@ function makeAgent(
   return agent
 }
 
-function makeHarness(harness: { sessionApi?: SessionApi } = {}) {
+function makeHarness(harness: { sessionApi?: SessionApi; agent?: FakeAgent } = {}) {
   const mounts: string[] = []
   const sections: Array<{ name: string; order: number; text: string }> = []
   const disposed: string[] = []
@@ -142,7 +152,7 @@ function makeHarness(harness: { sessionApi?: SessionApi } = {}) {
           setup?: (agentCtx: unknown) => Promise<void>
         }) => {
           created.push({ sessionId: options.sessionId })
-          const agent = makeAgent({ sessionApi: harness.sessionApi })
+          const agent = harness.agent ?? makeAgent({ sessionApi: harness.sessionApi })
           agent.session.id = options.sessionId
           if (options.agentOptions) agent.options = options.agentOptions
           if (options.setup) await options.setup({ systemPrompt: { section } })
@@ -162,7 +172,7 @@ function makeHarness(harness: { sessionApi?: SessionApi } = {}) {
           agentOptions?: { provider: string; model: string }
           setup?: (agentCtx: unknown) => Promise<void>
         }) => {
-          const agent = makeAgent({ sessionApi: harness.sessionApi })
+          const agent = harness.agent ?? makeAgent({ sessionApi: harness.sessionApi })
           agent.session.id = options.resumeSessionId
           if (options.agentOptions) agent.options = options.agentOptions
           if (options.setup) await options.setup({ systemPrompt: { section } })
@@ -1181,5 +1191,56 @@ describe('AgentPool on the dsh-session 0.1.5 session API', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     expect(renamed).toEqual(['性能优化'])
+  })
+
+  it('streams agent/assistant-stream frames instead of assistant/chunk events', async () => {
+    const deltas: Array<{ kind: string; text: string }> = []
+    const agent = makeAgent({
+      sessionApi: 'snapshot',
+      frames: [
+        { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 },
+        {
+          type: 'chunk',
+          attemptId: 'a1',
+          revision: 2,
+          index: 0,
+          chunk: { type: 'text-delta', index: 0, text: 'Hel' },
+        },
+        {
+          type: 'chunk',
+          attemptId: 'a1',
+          revision: 3,
+          index: 1,
+          chunk: { type: 'text-delta', index: 0, text: 'lo' },
+        },
+        {
+          type: 'chunk',
+          attemptId: 'a1',
+          revision: 4,
+          index: 2,
+          chunk: { type: 'reasoning-delta', index: 1, text: '想一下' },
+        },
+        {
+          type: 'end',
+          attemptId: 'a1',
+          revision: 5,
+          index: 3,
+          outcome: { kind: 'committed', eventType: 'assistant/message' },
+        },
+      ],
+    })
+    const { ctx } = makeHarness({ agent })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    const reply = await manager.handle(singleMessage(), noopDownload, (delta) => deltas.push(delta))
+
+    expect(deltas).toEqual([
+      { kind: 'text', text: 'Hel' },
+      { kind: 'text', text: 'lo' },
+      { kind: 'reasoning', text: '想一下' },
+    ])
+    expect(reply.text).toBe('Harness reply')
+    expect(reply.reasoning).toBe('想一下')
   })
 })

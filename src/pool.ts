@@ -39,6 +39,33 @@ export interface TurnDelta {
   text: string
 }
 
+/** One streamed assistant chunk, as both harness generations deliver it. */
+interface AssistantChunkLike {
+  type?: string
+  text?: string
+}
+
+/**
+ * Subscribe to the live assistant delta feed.
+ *
+ * dsh-agent 0.1.5-rc.x publishes attempt frames on the transient, agent-scoped
+ * `agent/assistant-stream` event and no longer appends `assistant/chunk` session
+ * events; 0.1.0-rc.x never emits the frame event. Subscribing to both keeps the
+ * WeCom stream and the reasoning summary working on either generation — the
+ * final answer always arrives through `assistant/message` regardless.
+ */
+function onAssistantChunk(agent: Agent, handler: (chunk: AssistantChunkLike) => void): () => void {
+  const ctx = agent.ctx as unknown as {
+    on(
+      name: string,
+      handler: (payload: { frame?: { type?: string; chunk?: AssistantChunkLike } }) => void,
+    ): () => void
+  }
+  return ctx.on('agent/assistant-stream', ({ frame }) => {
+    if (frame?.type === 'chunk') handler(frame.chunk ?? {})
+  })
+}
+
 /** The text one finished turn produced, plus optional reasoning/tool activity. */
 export interface Reply {
   text: string
@@ -1042,19 +1069,22 @@ export class AgentPool {
     const pendingCalls = new Map<string, { name: string; arguments: string }>()
     const toolCalls: ToolCallSummary[] = []
     const images: ImageAttachmentRef[] = []
+    /** Fold one model chunk into the live stream and the reasoning summary. */
+    const absorbChunk = (chunk: AssistantChunkLike): void => {
+      if (chunk.type === 'text-delta' && chunk.text) {
+        onDelta?.({ kind: 'text', text: chunk.text })
+      } else if (chunk.type === 'reasoning-delta' && chunk.text) {
+        reasoning.push(chunk.text)
+        onDelta?.({ kind: 'reasoning', text: chunk.text })
+      }
+    }
     // Observe this agent's session firehose for the duration of the turn:
     // forward text deltas for streaming and collect reasoning + tool activity
     // for the optional final summary. Scoped to the agent, so we see only its
-    // events and the listener is torn down with `off()` after the turn.
+    // events and the listeners are torn down with `off()` after the turn.
     const off = agent.ctx.on('session/event', (_session, event: SessionEvent) => {
       if (event.type === 'assistant/chunk') {
-        const chunk = event.data.chunk
-        if (chunk.type === 'text-delta' && chunk.text) {
-          onDelta?.({ kind: 'text', text: chunk.text })
-        } else if (chunk.type === 'reasoning-delta' && chunk.text) {
-          reasoning.push(chunk.text)
-          onDelta?.({ kind: 'reasoning', text: chunk.text })
-        }
+        absorbChunk(event.data.chunk)
       } else if (event.type === 'tool/call') {
         pendingCalls.set(event.data.callId, {
           name: event.data.name,
@@ -1080,6 +1110,8 @@ export class AgentPool {
         }
       }
     })
+    // dsh-agent 0.1.5-rc.x delivers the same deltas as transient attempt frames.
+    const offFrames = onAssistantChunk(agent, absorbChunk)
     try {
       const includeImages = containsImageMedia(message) ? await this.canViewImages(agent) : false
       const content = await toContentBlocks(
@@ -1091,6 +1123,7 @@ export class AgentPool {
       await this.settleTurn(agent)
     } finally {
       off()
+      offFrames()
     }
     const reply = this.extractText(sessionLogFrom(agent.session, start))
     if (reasoning.length > 0) reply.reasoning = reasoning.join('')
