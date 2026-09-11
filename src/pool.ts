@@ -52,6 +52,15 @@ interface AssistantFrameLike {
 }
 
 /**
+ * Tools whose image blocks are an EXISTING picture handed back to the model —
+ * the harness vision reader, not a card rendered for the chat. Forwarding them
+ * would echo the user's own upload straight back at them, so they are skipped
+ * when collecting the reply's images. `read_image` is the reader dsh-tool-fs
+ * registers for looking at a stored image.
+ */
+const IMAGE_READER_TOOLS = new Set(['read_image'])
+
+/**
  * Subscribe to the transient attempt frames dsh-agent 0.1.5-rc.x publishes on
  * the agent-scoped `agent/assistant-stream` event.
  *
@@ -1127,11 +1136,15 @@ export class AgentPool {
         })
         // Cards rendered by tools (e.g. render_card) arrive as image blocks in
         // the tool-result content; collect their durable refs for the reply.
-        for (const block of event.data.message.content ?? []) {
-          if (block.type !== 'tool-result') continue
-          for (const inner of block.content) {
-            if (inner.type === 'image') {
-              images.push(inner.attachment)
+        // Readers (read_image) instead hand back a picture the model asked to
+        // look at — usually the one the user just sent — so they are not cards.
+        if (call === undefined || !IMAGE_READER_TOOLS.has(call.name)) {
+          for (const block of event.data.message.content ?? []) {
+            if (block.type !== 'tool-result') continue
+            for (const inner of block.content) {
+              if (inner.type === 'image') {
+                images.push(inner.attachment)
+              }
             }
           }
         }

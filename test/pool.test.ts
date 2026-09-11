@@ -132,6 +132,48 @@ function makeAgent(
   return agent
 }
 
+/**
+ * A turn whose single tool call returns one image block — the shape both the
+ * harness vision reader (`read_image`) and a card renderer (`render_card`) use.
+ */
+function makeImageTurn(toolName: string, attachmentId: string): FakeAgent {
+  return makeAgent({
+    stream: [
+      {
+        type: 'tool/call',
+        data: { turn: 1, step: 1, callId: 'c1', name: toolName, arguments: '{}' },
+      },
+      {
+        type: 'tool/result',
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            source: { kind: 'tool', callId: 'c1' },
+            content: [
+              {
+                type: 'tool-result',
+                content: [
+                  {
+                    type: 'image',
+                    attachment: {
+                      attachmentId,
+                      mediaType: 'image/png',
+                      bytes: 3,
+                      width: 10,
+                      height: 10,
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    ],
+  })
+}
+
 function makeHarness(harness: { sessionApi?: SessionApi; agent?: FakeAgent } = {}) {
   const mounts: string[] = []
   const sections: Array<{ name: string; order: number; text: string }> = []
@@ -1004,6 +1046,30 @@ describe('AgentPool', () => {
     expect(reply.toolCalls).toEqual([
       { name: 'read', arguments: '{"path":"x"}', ok: false, error: 'EIO' },
     ])
+  })
+
+  it('does not ship an image that read_image handed back to the model', async () => {
+    const { ctx } = makeHarness({ agent: makeImageTurn('read_image', 'sha256:user-upload') })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    const reply = await manager.handle(singleMessage('这是什么'), noopDownload)
+
+    // The user's own upload is not a card: it must not be echoed back.
+    expect(reply.images).toBeUndefined()
+    // The call itself still shows up in the activity summary.
+    expect(reply.toolCalls?.map((call) => call.name)).toEqual(['read_image'])
+  })
+
+  it('still ships an image a card tool rendered', async () => {
+    const { ctx } = makeHarness({ agent: makeImageTurn('render_card', 'card-1') })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    const reply = await manager.handle(singleMessage('画个图'), noopDownload)
+
+    expect(reply.images).toHaveLength(1)
+    expect(reply.images?.[0]?.attachmentId).toBe('card-1')
   })
 
   it('adopts a live session instead of trying to resume it again', async () => {
