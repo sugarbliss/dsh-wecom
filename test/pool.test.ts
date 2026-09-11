@@ -174,6 +174,56 @@ function makeImageTurn(toolName: string, attachmentId: string): FakeAgent {
   })
 }
 
+/**
+ * A Code Mode turn: `run_code` bridges one sub-call (the harness logs it on
+ * `tool/ptc-dispatch`) and attaches that sub-result's image to the OUTER
+ * `run_code` result — so the name on the result is `run_code`, not the tool that
+ * produced the picture.
+ */
+function makePtcImageTurn(
+  subCalls: readonly { name: string; attachmentId: string }[],
+  eventType = 'tool/ptc-dispatch',
+): FakeAgent {
+  const contents = subCalls.map(({ attachmentId }) => [
+    { type: 'text', text: 'sub-call output' },
+    {
+      type: 'image',
+      attachment: { attachmentId, mediaType: 'image/png', bytes: 3, width: 10, height: 10 },
+    },
+  ])
+  return makeAgent({
+    stream: [
+      {
+        type: 'tool/call',
+        data: { turn: 1, step: 1, callId: 'c1', name: 'run_code', arguments: '{}' },
+      },
+      ...subCalls.map(({ name }, index) => ({
+        type: eventType,
+        data: {
+          rootCallId: 'c1',
+          parentCallId: 'c1',
+          subCallId: `c1:ptc:${index + 1}`,
+          name,
+          arguments: {},
+          isError: false,
+          content: contents[index],
+        },
+      })),
+      {
+        type: 'tool/result',
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            source: { kind: 'tool', callId: 'c1' },
+            content: [{ type: 'tool-result', content: contents.flat() }],
+          },
+        },
+      },
+    ],
+  })
+}
+
 function makeHarness(harness: { sessionApi?: SessionApi; agent?: FakeAgent } = {}) {
   const mounts: string[] = []
   const sections: Array<{ name: string; order: number; text: string }> = []
@@ -1070,6 +1120,72 @@ describe('AgentPool', () => {
 
     expect(reply.images).toHaveLength(1)
     expect(reply.images?.[0]?.attachmentId).toBe('card-1')
+  })
+
+  it('does not ship an image read_image produced inside run_code (PTC)', async () => {
+    const { ctx } = makeHarness({
+      agent: makePtcImageTurn([{ name: 'read_image', attachmentId: 'sha256:user-upload' }]),
+    })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    const reply = await manager.handle(singleMessage('这是什么'), noopDownload)
+
+    // The outer result is named `run_code`; the reader is only visible on the
+    // sub-dispatch, which must still keep the user's own picture out of the chat.
+    expect(reply.images).toBeUndefined()
+  })
+
+  it('still ships an image a card tool rendered inside run_code (PTC)', async () => {
+    const { ctx } = makeHarness({
+      agent: makePtcImageTurn([{ name: 'render_card', attachmentId: 'card-2' }]),
+    })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    const reply = await manager.handle(singleMessage('画个图'), noopDownload)
+
+    expect(reply.images?.map((ref) => ref.attachmentId)).toEqual(['card-2'])
+  })
+
+  it('ships a rendered image even when read_image returns the same attachment inside run_code', async () => {
+    const { ctx } = makeHarness({
+      agent: makePtcImageTurn([
+        { name: 'render_card', attachmentId: 'shared-image' },
+        { name: 'read_image', attachmentId: 'shared-image' },
+      ]),
+    })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    const reply = await manager.handle(singleMessage('画图并检查'), noopDownload)
+
+    expect(reply.images?.map((ref) => ref.attachmentId)).toEqual(['shared-image'])
+  })
+
+  it('recognizes the legacy tool/code-dispatch event name', async () => {
+    const { ctx } = makeHarness({
+      agent: makePtcImageTurn(
+        [{ name: 'read_image', attachmentId: 'sha256:user-upload' }],
+        'tool/code-dispatch',
+      ),
+    })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    const reply = await manager.handle(singleMessage('这是什么'), noopDownload)
+
+    expect(reply.images).toBeUndefined()
+  })
+
+  it('falls back to the outer run_code result when no sub-dispatch event is available', async () => {
+    const { ctx } = makeHarness({ agent: makeImageTurn('run_code', 'compat-card') })
+    const manager = new AgentPool(ctx as never, testConfig())
+    await manager.start()
+
+    const reply = await manager.handle(singleMessage('画个图'), noopDownload)
+
+    expect(reply.images?.map((ref) => ref.attachmentId)).toEqual(['compat-card'])
   })
 
   it('adopts a live session instead of trying to resume it again', async () => {

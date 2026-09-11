@@ -55,10 +55,44 @@ interface AssistantFrameLike {
  * Tools whose image blocks are an EXISTING picture handed back to the model —
  * the harness vision reader, not a card rendered for the chat. Forwarding them
  * would echo the user's own upload straight back at them, so they are skipped
- * when collecting the reply's images. `read_image` is the reader dsh-tool-fs
- * registers for looking at a stored image.
+ * when collecting the reply's images — both when such a tool is called directly
+ * and when a `run_code` program bridges it (see SUB_DISPATCH_EVENTS).
+ * `read_image` is the reader dsh-tool-fs registers for looking at a stored image.
  */
 const IMAGE_READER_TOOLS = new Set(['read_image'])
+
+/**
+ * Nested tool-dispatch events. A Code Mode (`run_code`) program bridges every
+ * sub-call through these, and the enclosing result carries the images those
+ * sub-calls produced while being named `run_code` itself — so the reader behind
+ * an image is only visible on the SUB-call name.
+ *
+ * 0.1.5-rc.x logs `tool/ptc-dispatch`; 0.1.0-rc.x logged the same payload under
+ * `tool/code-dispatch`.
+ */
+const SUB_DISPATCH_EVENTS = new Set(['tool/ptc-dispatch', 'tool/code-dispatch'])
+
+/**
+ * Collect the image attachment refs inside one tool-result content tree: the
+ * blocks a native result carries, or the ones a `run_code` result has attached
+ * from its sub-calls. Preserve occurrence order; deciding whether an image is
+ * user-facing belongs to the producing call, not to its content-addressed id.
+ */
+function collectImageRefs(content: unknown, into: ImageAttachmentRef[]): void {
+  if (!Array.isArray(content)) return
+  for (const block of content as Array<{
+    type?: unknown
+    attachment?: ImageAttachmentRef
+    content?: unknown
+  }>) {
+    if (block === null || typeof block !== 'object') continue
+    if (block.type === 'image' && block.attachment !== undefined) {
+      into.push(block.attachment)
+      continue
+    }
+    if (block.type === 'tool-result') collectImageRefs(block.content, into)
+  }
+}
 
 /**
  * Subscribe to the transient attempt frames dsh-agent 0.1.5-rc.x publishes on
@@ -1104,7 +1138,10 @@ export class AgentPool {
     const reasoning: string[] = []
     const pendingCalls = new Map<string, { name: string; arguments: string }>()
     const toolCalls: ToolCallSummary[] = []
+    /** User-facing images, collected at the direct or bridged call that produced them. */
     const images: ImageAttachmentRef[] = []
+    /** Outer calls whose images were already classified through sub-dispatch events. */
+    const compositeCalls = new Set<string>()
     /** Fold one model chunk into the live stream and the reasoning summary. */
     const absorbChunk = (chunk: AssistantChunkLike): void => {
       if (chunk.type === 'text-delta' && chunk.text) {
@@ -1126,8 +1163,28 @@ export class AgentPool {
           name: event.data.name,
           arguments: event.data.arguments,
         })
+      } else if (SUB_DISPATCH_EVENTS.has(String(event.type))) {
+        // Classify an image at its real sub-call producer. The enclosing
+        // `run_code` result aggregates these blocks under its own name, so it
+        // must not be collected again after at least one valid dispatch event.
+        const dispatch = (
+          event as unknown as {
+            data?: { parentCallId?: unknown; name?: unknown; content?: unknown }
+          }
+        ).data
+        if (
+          typeof dispatch?.parentCallId === 'string' &&
+          dispatch.parentCallId.length > 0 &&
+          typeof dispatch.name === 'string'
+        ) {
+          compositeCalls.add(dispatch.parentCallId)
+          if (!IMAGE_READER_TOOLS.has(dispatch.name)) {
+            collectImageRefs(dispatch.content, images)
+          }
+        }
       } else if (event.type === 'tool/result') {
-        const call = pendingCalls.get(event.data.message.source.callId)
+        const callId = event.data.message.source.callId
+        const call = pendingCalls.get(callId)
         toolCalls.push({
           name: call?.name ?? event.data.message.source.callId,
           arguments: call?.arguments ?? '',
@@ -1138,15 +1195,11 @@ export class AgentPool {
         // the tool-result content; collect their durable refs for the reply.
         // Readers (read_image) instead hand back a picture the model asked to
         // look at — usually the one the user just sent — so they are not cards.
-        if (call === undefined || !IMAGE_READER_TOOLS.has(call.name)) {
-          for (const block of event.data.message.content ?? []) {
-            if (block.type !== 'tool-result') continue
-            for (const inner of block.content) {
-              if (inner.type === 'image') {
-                images.push(inner.attachment)
-              }
-            }
-          }
+        if (
+          (call === undefined || !IMAGE_READER_TOOLS.has(call.name)) &&
+          !compositeCalls.has(String(callId))
+        ) {
+          collectImageRefs(event.data.message.content, images)
         }
       }
     })
