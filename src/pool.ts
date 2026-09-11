@@ -45,24 +45,27 @@ interface AssistantChunkLike {
   text?: string
 }
 
+/** One transient attempt frame: `start`, `chunk` or `end`. */
+interface AssistantFrameLike {
+  type?: string
+  chunk?: AssistantChunkLike
+}
+
 /**
- * Subscribe to the live assistant delta feed.
+ * Subscribe to the transient attempt frames dsh-agent 0.1.5-rc.x publishes on
+ * the agent-scoped `agent/assistant-stream` event.
  *
- * dsh-agent 0.1.5-rc.x publishes attempt frames on the transient, agent-scoped
- * `agent/assistant-stream` event and no longer appends `assistant/chunk` session
- * events; 0.1.0-rc.x never emits the frame event. Subscribing to both keeps the
- * WeCom stream and the reasoning summary working on either generation — the
- * final answer always arrives through `assistant/message` regardless.
+ * 0.1.0-rc.x never emits this event (its deltas are durable `assistant/chunk`
+ * session events instead), so callers subscribe to BOTH feeds: the frames are
+ * the only live deltas on 0.1.5, and — because they are transient — they are
+ * also the only progress signal a long answer gives while it is streaming.
  */
-function onAssistantChunk(agent: Agent, handler: (chunk: AssistantChunkLike) => void): () => void {
+function onAssistantFrame(agent: Agent, handler: (frame: AssistantFrameLike) => void): () => void {
   const ctx = agent.ctx as unknown as {
-    on(
-      name: string,
-      handler: (payload: { frame?: { type?: string; chunk?: AssistantChunkLike } }) => void,
-    ): () => void
+    on(name: string, handler: (payload: { frame?: AssistantFrameLike }) => void): () => void
   }
   return ctx.on('agent/assistant-stream', ({ frame }) => {
-    if (frame?.type === 'chunk') handler(frame.chunk ?? {})
+    if (frame !== undefined) handler(frame)
   })
 }
 
@@ -388,6 +391,8 @@ export class AgentPool {
   private workspacePromise: Map<string, Promise<WorkspaceLike | undefined>> | undefined
   /** Stored session cwd per conversation id, loaded at start and updated on create. */
   private headerCwds = new Map<string, string>()
+  /** Resolved per-conversation directory, minted once per session id (see conversationDir). */
+  private readonly conversationDirs = new Map<string, string>()
   /**
    * Per-chat directories whose workspace row the user deleted in the web UI.
    * Tombstones are recorded by a runtime watcher and persisted in the state
@@ -666,6 +671,22 @@ export class AgentPool {
    * as-is once a chat already has one, so live sessions never move.
    */
   private conversationDir(id: string): string {
+    // Resolved ONCE per session id. The name below is minted from the clock, and
+    // the create path asks for it repeatedly (the session header cwd first, the
+    // workspace mkdir after the harness has created the session). Recomputing it
+    // lets the stamp cross a second boundary in between, so the session records
+    // a cwd that was never created — and every tool spawn in that session then
+    // fails with ENOENT on the missing directory.
+    const cached = this.conversationDirs.get(id)
+    if (cached !== undefined) return cached
+    // A session we already know the cwd of (resumed, or created earlier in this
+    // process) is authoritative: the harness stores the session there and spawns
+    // its tools there, so every later lookup must agree with it.
+    const stored = this.headerCwds.get(id)
+    if (stored !== undefined) {
+      this.conversationDirs.set(id, stored)
+      return stored
+    }
     // Keyed by the FULL session id: each /reset epoch (its own session id,
     // ~gN suffix) mints a distinct directory, so every session gets its own
     // sandbox cwd and its own workspace row.
@@ -674,11 +695,17 @@ export class AgentPool {
     const pattern = new RegExp(`^WeCom-.*-${escaped}$`)
     try {
       const hit = readdirSync(this.config.cwd).find((name) => pattern.test(name))
-      if (hit !== undefined) return join(this.config.cwd, hit)
+      if (hit !== undefined) {
+        const dir = join(this.config.cwd, hit)
+        this.conversationDirs.set(id, dir)
+        return dir
+      }
     } catch {
       // base not readable yet — fall through to mint a new name
     }
-    return join(this.config.cwd, `WeCom-${this.peerTag(id)}-${this.firstSeenStamp()}-${tail6}`)
+    const dir = join(this.config.cwd, `WeCom-${this.peerTag(id)}-${this.firstSeenStamp()}-${tail6}`)
+    this.conversationDirs.set(id, dir)
+    return dir
   }
 
   /** Readable, filesystem-safe peer tag for the directory name. */
@@ -1111,7 +1138,9 @@ export class AgentPool {
       }
     })
     // dsh-agent 0.1.5-rc.x delivers the same deltas as transient attempt frames.
-    const offFrames = onAssistantChunk(agent, absorbChunk)
+    const offFrames = onAssistantFrame(agent, (frame) => {
+      if (frame.type === 'chunk') absorbChunk(frame.chunk ?? {})
+    })
     try {
       const includeImages = containsImageMedia(message) ? await this.canViewImages(agent) : false
       const content = await toContentBlocks(
@@ -1160,6 +1189,12 @@ export class AgentPool {
     const off = agent.ctx.on('session/event', () => {
       arm()
     })
+    // 0.1.5-rc.x streams through transient frames instead of durable session
+    // events, so liveness has to follow that feed too: without it a long answer
+    // that is still producing tokens looks "no progress" and gets cancelled.
+    const offFrames = onAssistantFrame(agent, () => {
+      arm()
+    })
     arm()
     const watchIdle = agent.whenIdle().then(() => {
       if (!timedOut) settle?.()
@@ -1168,6 +1203,7 @@ export class AgentPool {
       await idle
     } finally {
       off()
+      offFrames()
       if (timer !== undefined) clearTimeout(timer)
       void watchIdle.catch(() => undefined)
     }
@@ -1213,6 +1249,7 @@ export class AgentPool {
     const setup = this.mountPreset(resolvedPreset)
 
     if (this.persisted.has(id)) {
+      await this.ensureStoredCwd(id)
       const handle = await this.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions,
@@ -1234,6 +1271,27 @@ export class AgentPool {
     this.headerCwds.set(id, this.conversationDir(id))
     await this.groupSession(id, this.conversationDir(id), { revive: true })
     return handle
+  }
+
+  /**
+   * Make sure the directory a persisted session was recorded in exists.
+   *
+   * Directory names are minted from the clock (see {@link conversationDir}), so
+   * a session created before that name was resolved once could be recorded in a
+   * path the workspace `mkdir` never created — its tools then spawn in a missing
+   * cwd and fail with ENOENT. Creating the recorded path repairs such a session
+   * in place. Only paths inside our own workspace root are touched.
+   */
+  private async ensureStoredCwd(id: string): Promise<void> {
+    const stored = this.headerCwds.get(id)
+    if (stored === undefined) return
+    const root = this.config.cwd.endsWith('/') ? this.config.cwd : `${this.config.cwd}/`
+    if (!stored.startsWith(root)) return
+    try {
+      await mkdir(stored, { recursive: true })
+    } catch (error) {
+      this.log.warn('WeCom workspace repair failed for %s: %s', stored, String(error))
+    }
   }
 
   /**

@@ -1,4 +1,5 @@
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { conversationId } from '../src/helpers.js'
@@ -17,6 +18,8 @@ interface FakeAgent {
   followup: ReturnType<typeof vi.fn>
   whenIdle: ReturnType<typeof vi.fn>
   fire: (event: string, ...args: unknown[]) => void
+  /** Finish a `hang: true` turn: push the closing events, then go idle. */
+  release: () => void
 }
 
 /** Which harness session API the double should look like. */
@@ -61,6 +64,24 @@ function makeAgent(
   const fire = (event: string, ...args: unknown[]): void => {
     for (const handler of handlers.get(event) ?? []) handler(...args)
   }
+  let releaseIdle: (() => void) | undefined
+  let idle: Promise<void> | undefined
+  /** The events every completed turn ends with (mirrors the real harness). */
+  const closeTurn = (): void => {
+    const closing = [
+      {
+        type: 'assistant/message',
+        data: {
+          message: { content: [{ type: 'text', text: options.replyText ?? 'Harness reply' }] },
+        },
+      },
+      { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+    ]
+    for (const event of closing) {
+      events.push(event)
+      fire('session/event', agent.session, event)
+    }
+  }
   const agent: FakeAgent = {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
@@ -85,19 +106,27 @@ function makeAgent(
       // 0.1.5-rc.x: the same deltas arrive as transient attempt frames on an
       // agent-scoped event and never enter the durable session log.
       for (const frame of options.frames ?? []) fire('agent/assistant-stream', { agent, frame })
-      events.push({
-        type: 'assistant/message',
-        data: {
-          message: { content: [{ type: 'text', text: options.replyText ?? 'Harness reply' }] },
-        },
-      })
-      events.push({ type: 'turn/end', data: { reason: { kind: 'completed' } } })
+      closeTurn()
     }),
     whenIdle: vi.fn(() => {
-      if (options.hang) return new Promise(() => undefined)
+      if (options.hang) {
+        idle ??= new Promise<void>((resolve) => {
+          releaseIdle = resolve
+        })
+        return idle.then(() => {
+          agent.status = 'idle'
+        })
+      }
       agent.status = 'idle'
       return Promise.resolve()
     }),
+    release: () => {
+      if (releaseIdle === undefined) return
+      closeTurn()
+      const resolve = releaseIdle
+      releaseIdle = undefined
+      resolve()
+    },
     fire,
   }
   return agent
@@ -615,9 +644,14 @@ describe('AgentPool', () => {
     // their own row; mismatched cwds create nothing.
     expect(create).toHaveBeenCalledTimes(3)
     const paths = create.mock.calls.map((call) => call[0])
-    expect(paths[0]).toMatch(/^\/tmp\/wecom-test\/WeCom-.+-\d{4}-\d{6}-abcdef$/)
-    expect(paths[1]).toMatch(/^\/tmp\/wecom-test\/WeCom-.+-\d{4}-\d{6}-def~g2$/)
-    expect(paths[2]).toMatch(/^\/tmp\/wecom-test\/WeCom-.+-\d{4}-\d{6}-xyz789$/)
+    // The row's canonical cwd IS the session's recorded cwd: a resumed session
+    // runs where the harness stored it, so the workspace must not mint a second
+    // name for it (that mismatch is what broke the sandbox cwd).
+    expect(paths).toEqual([
+      '/tmp/wecom-test/WeCom-u1-0821-abcdef',
+      '/tmp/wecom-test/WeCom-u1-0821-def~g2',
+      '/tmp/wecom-test/WeCom-grp-0821-xyz789',
+    ])
   })
 
   it('a failing attach never fails the message itself', async () => {
@@ -1242,5 +1276,100 @@ describe('AgentPool on the dsh-session 0.1.5 session API', () => {
     ])
     expect(reply.text).toBe('Harness reply')
     expect(reply.reasoning).toBe('想一下')
+  })
+
+  it('keeps a turn alive on transient frames alone (no-progress timeout)', async () => {
+    const agent = makeAgent({ hang: true, sessionApi: 'snapshot' })
+    const { ctx } = makeHarness({ agent })
+    const manager = new AgentPool(ctx as never, testConfig({ turnTimeoutMs: 40 }))
+    await manager.start()
+
+    const turn = manager.handle(singleMessage('hi'), noopDownload)
+    // Five 20ms beats: twice the timeout in total, but every frame resets it.
+    for (let beat = 0; beat < 5; beat += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      agent.fire('agent/assistant-stream', {
+        agent,
+        frame: { type: 'chunk', chunk: { type: 'text-delta', index: 0, text: 'x' } },
+      })
+    }
+    agent.release()
+
+    await expect(turn).resolves.toMatchObject({ text: 'Harness reply' })
+    expect(agent.cancel).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * Directory names are minted from the clock, so recomputing one mid-create can
+ * straddle a second boundary: the session then records a cwd that the workspace
+ * `mkdir` never created, and every tool spawn in that session fails ENOENT.
+ */
+describe('AgentPool workspace identity', () => {
+  it('keeps the session cwd and the workspace path identical when the clock ticks mid-create', async () => {
+    vi.useFakeTimers()
+    // Own workspace root: this test mints (and could leave) real directories.
+    const root = mkdtempSync(join(tmpdir(), 'wecom-ws-'))
+    try {
+      vi.setSystemTime(new Date('2026-09-11T08:14:27Z'))
+      const { ctx, created } = makeHarness()
+      const create = ctx.agents.create as ReturnType<typeof vi.fn>
+      const inner = create.getMockImplementation()
+      expect(inner).toBeDefined()
+      // Cross a second boundary while the harness creates the session.
+      create.mockImplementation(async (options: never) => {
+        vi.advanceTimersByTime(1_500)
+        return inner?.(options)
+      })
+      const paths: string[] = []
+      ;(ctx.get as ReturnType<typeof vi.fn>).mockImplementation((name: string) =>
+        name === 'workspaceRegistry'
+          ? {
+              create: vi.fn(async (path: string) => {
+                paths.push(path)
+                return { attachSession: vi.fn(async () => undefined) }
+              }),
+            }
+          : undefined,
+      )
+      const manager = new AgentPool(ctx as never, testConfig({ cwd: root }))
+      await manager.start()
+
+      await manager.handle(singleMessage('hi'), noopDownload)
+
+      expect(created).toHaveLength(1)
+      const passed = create.mock.calls[0]?.[0] as { meta?: { cwd?: string } } | undefined
+      const sessionCwd = passed?.meta?.cwd
+      expect(sessionCwd).toBeDefined()
+      expect(paths).toContain(sessionCwd)
+    } finally {
+      vi.useRealTimers()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('repairs a persisted session whose recorded cwd is missing', async () => {
+    // Own workspace root: the repaired directory must not leak into the
+    // shared test cwd, where the adoption lookup would later find it.
+    const root = mkdtempSync(join(tmpdir(), 'wecom-repair-'))
+    try {
+      const base = conversationId(testConfig().namespace, singleMessage('hi') as never)
+      const cwd = join(root, `WeCom-u1-0911-161427-${base.slice(-6)}`)
+      const { ctx } = makeHarness()
+      ;(ctx.sessionPersistence.list as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: base, cwd },
+      ])
+      const manager = new AgentPool(ctx as never, testConfig({ cwd: root }))
+      await manager.start()
+      expect(existsSync(cwd)).toBe(false)
+
+      await manager.handle(singleMessage('hi'), noopDownload)
+
+      // dsh resumed the session where it was recorded, so that directory must exist.
+      expect(ctx.agents.resume).toHaveBeenCalled()
+      expect(existsSync(cwd)).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
