@@ -1554,4 +1554,31 @@ describe('AgentPool workspace identity', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it('recognizes persisted sessions listed as 0.1.5 snapshot wrappers', async () => {
+    // 0.1.5-rc.x returns `{ header, revision, sizeBytes }` from list(); reading
+    // `entry.id` left `persisted` empty and every restart re-created (and thus
+    // failed on) sessions that already had a log.
+    const root = mkdtempSync(join(tmpdir(), 'wecom-snapshot-'))
+    try {
+      const base = conversationId(testConfig().namespace, singleMessage('hi') as never)
+      const cwd = join(root, `WeCom-u1-0911-161427-${base.slice(-6)}`)
+      const { ctx } = makeHarness()
+      ;(ctx.sessionPersistence.list as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { header: { id: base, cwd }, revision: 'r1', sizeBytes: 42 },
+      ])
+      const manager = new AgentPool(ctx as never, testConfig({ cwd: root }))
+      await manager.start()
+
+      await manager.handle(singleMessage('hi'), noopDownload)
+
+      // Resumed as a known session (never re-created)…
+      expect(ctx.agents.resume).toHaveBeenCalled()
+      expect(ctx.agents.create).not.toHaveBeenCalled()
+      // …and its recorded cwd is both honoured and repaired.
+      expect(existsSync(cwd)).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })

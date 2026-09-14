@@ -23,7 +23,13 @@ import type { ResolvedConfig } from './config.js'
 import { clipUtf8, conversationId, Semaphore } from './helpers.js'
 import { type MediaPort, safeFilename, saveUploadFile } from './media.js'
 import { containsImageMedia, toContentBlocks } from './message.js'
-import { type SessionLogLike, sessionLog, sessionLogFrom, sessionLogLength } from './session-log.js'
+import {
+  type SessionLogLike,
+  sessionLog,
+  sessionLogFrom,
+  sessionLogLength,
+  storedSessionHeader,
+} from './session-log.js'
 
 /** One tool invocation observed during a turn, for the optional activity summary. */
 export interface ToolCallSummary {
@@ -486,11 +492,14 @@ export class AgentPool {
    * `groupSession` covers any later first message regardless.
    */
   async start(): Promise<void> {
-    const headers = await this.ctx.sessionPersistence.list()
-    this.persisted = new Set(headers.map((header) => String(header.id)))
+    // `list()` hands back stored headers on 0.1.0-rc.x but snapshot wrappers on
+    // 0.1.5-rc.x, so unwrap both (see storedSessionHeader).
+    const headers = (await this.ctx.sessionPersistence.list())
+      .map(storedSessionHeader)
+      .filter((header) => header !== undefined)
+    this.persisted = new Set(headers.map((header) => header.id))
     for (const header of headers) {
-      const cwd = (header as { cwd?: string }).cwd
-      if (cwd !== undefined) this.headerCwds.set(String(header.id), cwd)
+      if (header.cwd !== undefined) this.headerCwds.set(header.id, header.cwd)
     }
     await mkdir(this.config.cwd, { recursive: true })
     this.loadState()
@@ -509,10 +518,8 @@ export class AgentPool {
     // gates the retry loop only; workspaces resolve inside groupSession.
     if (this.ctx.get('workspaceRegistry') !== undefined) {
       for (const header of headers) {
-        const id = String(header.id)
-        const cwd = (header as { cwd?: string }).cwd
-        if (id.startsWith('dsh-wecom-') && cwd !== undefined) {
-          await this.groupSession(id, cwd)
+        if (header.id.startsWith('dsh-wecom-') && header.cwd !== undefined) {
+          await this.groupSession(header.id, header.cwd)
         }
       }
     }

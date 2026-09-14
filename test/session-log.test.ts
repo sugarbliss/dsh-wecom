@@ -4,6 +4,7 @@ import {
   sessionLog,
   sessionLogFrom,
   sessionLogLength,
+  storedSessionHeader,
 } from '../src/session-log.js'
 
 /** The events a test session holds; only their identity matters here. */
@@ -55,5 +56,36 @@ describe('session log compatibility', () => {
       snapshotEvents: () => events,
     }
     expect(sessionLog(both)).toEqual(events)
+  })
+})
+
+describe('storedSessionHeader', () => {
+  it('reads the header behind a 0.1.5 snapshot wrapper', () => {
+    expect(
+      storedSessionHeader({
+        header: { id: 'dsh-wecom-single-a', cwd: '/root/ws/a' },
+        revision: 'r1',
+        sizeBytes: 42,
+      }),
+    ).toEqual({ id: 'dsh-wecom-single-a', cwd: '/root/ws/a' })
+  })
+
+  it('reads a 0.1.0-rc.x stored header directly', () => {
+    expect(storedSessionHeader({ id: 'session-b', cwd: '/root/ws/b' })).toEqual({
+      id: 'session-b',
+      cwd: '/root/ws/b',
+    })
+  })
+
+  it('returns undefined when the entry carries no id', () => {
+    expect(storedSessionHeader({ header: {}, revision: 'r' })).toBeUndefined()
+    expect(storedSessionHeader({ revision: 'r' })).toBeUndefined()
+    expect(storedSessionHeader(null)).toBeUndefined()
+    expect(storedSessionHeader('nope')).toBeUndefined()
+  })
+
+  it('omits a cwd that is not a string', () => {
+    expect(storedSessionHeader({ header: { id: 's3', cwd: 7 } })).toEqual({ id: 's3' })
+    expect(storedSessionHeader({ id: 's4' })).toEqual({ id: 's4' })
   })
 })
